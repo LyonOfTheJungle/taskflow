@@ -181,6 +181,14 @@ class TaskParams {
   @brief C-styled pointer to user data
   */
   void* data {nullptr};
+
+  /**
+  @brief scheduling priority of the task (see tf::TaskPriority)
+
+  Used by asynchronous tasking to submit work at a given priority. Defaults to
+  tf::TaskPriority::NORMAL.
+  */
+  TaskPriority priority {TaskPriority::NORMAL};
 };
 
 /**
@@ -511,9 +519,13 @@ class Node : public NodeBase {
   private:
   
   std::string _name;
-  
+
   void* _data {nullptr};
-  
+
+  // scheduling priority; lower value = higher priority (see tf::TaskPriority).
+  // routed by the executor into the matching per-priority work-stealing queue.
+  unsigned _priority {static_cast<unsigned>(TaskPriority::NORMAL)};
+
   Topology* _topology {nullptr};
 
   size_t _num_successors {0};
@@ -633,6 +645,7 @@ Node::Node(
   NodeBase(nstate, estate, parent, join_counter),
   _name     {params.name},
   _data     {params.data},
+  _priority {static_cast<unsigned>(params.priority)},
   _topology {topology},
   _handle   {std::forward<Args>(args)...} {
 }

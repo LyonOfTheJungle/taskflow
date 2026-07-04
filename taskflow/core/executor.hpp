@@ -94,6 +94,41 @@ class Executor {
   );
 
   /**
+  @brief constructs the executor with @c N workers, of which @c num_reserved
+         are reserved for high-priority tasks
+
+  @param N number of workers (must be positive)
+  @param num_reserved number of workers reserved for tf::TaskPriority::HIGH
+         tasks (must be less than @c N)
+  @param wif optional interface to configure workers' behaviors
+
+  A reserved worker only ever executes tasks of tf::TaskPriority::HIGH.
+  Because the scheduler is non-preemptive, priority ordering alone cannot get
+  a high-priority task's latency below the duration of one already-running
+  task; reserving capacity can, since a reserved worker stays idle (parked)
+  while only lower-priority work exists and picks up a high-priority task the
+  moment it is scheduled.
+
+  @code{.cpp}
+  // 8 workers, one of which only runs HIGH tasks
+  tf::Executor executor(8, 1);
+  executor.async(tf::TaskParams{.priority=tf::TaskPriority::HIGH}, []{ render(); });
+  @endcode
+
+  @attention
+  Reserved capacity trades throughput for latency: a reserved worker
+  contributes nothing to lower-priority work even when the executor is
+  saturated with it. On a build with `TF_MAX_PRIORITY == 1` (priority
+  scheduling compiled out) @c num_reserved is ignored and all workers behave
+  as general workers.
+  */
+  Executor(
+    size_t N,
+    size_t num_reserved,
+    std::shared_ptr<WorkerInterface> wif = nullptr
+  );
+
+  /**
   @brief destructs the executor
 
   The destructor calls Executor::wait_for_all to wait for all submitted
@@ -523,6 +558,7 @@ class Executor {
   @brief queries the number of work-stealing queues used by the executor
   */
   size_t num_queues() const noexcept;
+
 
   /**
   @brief queries the number of running topologies at the time of this call
@@ -1103,15 +1139,36 @@ requires (!std::same_as<std::decay_t<I>, AsyncTask>)
   
   struct Buffer {
     std::mutex mutex;
-    UnboundedWSQ<Node*> queue;
-  };  
+    // one overflow queue per priority level so spilled tasks keep their
+    // priority; only push is serialized by the mutex, steal is lock-free.
+    std::array<UnboundedWSQ<Node*>, TF_MAX_PRIORITY> queue;
+  };
   
   std::vector<Worker> _workers;
   std::vector<Buffer> _buffers;
-  
+
+#if TF_MAX_PRIORITY > 1
+  // number of reserved high-priority workers (see the reserved-capacity
+  // constructor); they occupy the tail ids [_workers.size() - _num_reserved,
+  // _workers.size()) so the id-based logic for general workers is unaffected.
+  // Declared before the notifiers because it determines their sizes.
+  const size_t _num_reserved;
+#else
+  // priority machinery is compiled out; the constant lets reserved-worker
+  // branches fold away without sprinkling #if at every use site
+  static constexpr size_t _num_reserved = 0;
+#endif
+
   // notifier's state variable and num_topologies should sit on different cachelines
   // or the false sharing can cause serious performance drop
   alignas(TF_CACHELINE_SIZE) DefaultNotifier _notifier;
+#if TF_MAX_PRIORITY > 1
+  // Reserved workers sleep on their own notifier: they only execute
+  // priority-0 work, so a wakeup for lower-priority work must never be
+  // consumed by them (the woken reserved worker would re-check only
+  // priority-0 queues and go back to sleep, losing the wakeup for good).
+  alignas(TF_CACHELINE_SIZE) DefaultNotifier _hp_notifier;
+#endif
   alignas(TF_CACHELINE_SIZE) std::atomic<size_t> _num_topologies {0};
   
   std::unordered_map<std::thread::id, Worker*> _t2w;
@@ -1127,6 +1184,46 @@ requires (!std::same_as<std::decay_t<I>, AsyncTask>)
   void _schedule(Node*);
   void _schedule_graph(Worker&, Graph&, Topology*, NodeBase*);
   void _spill(Node*);
+
+  // true if the worker id belongs to a reserved high-priority worker;
+  // folds to false when TF_MAX_PRIORITY == 1 (_num_reserved is constexpr 0)
+  bool _is_reserved(size_t wid) const noexcept {
+    return wid >= _workers.size() - _num_reserved;
+  }
+
+  // wakes up to `count` reserved workers after priority-0 work was scheduled
+#if TF_MAX_PRIORITY > 1
+  void _notify_hp(size_t count) {
+    if(_num_reserved && count) {
+      count == 1 ? _hp_notifier.notify_one() : _hp_notifier.notify_n(count);
+    }
+  }
+  bool _wait_for_task_reserved(Worker&, Node*&);
+#else
+  void _notify_hp(size_t) {}
+#endif
+
+  // priority-queue helpers (see tf::TaskPriority). All fold to a single
+  // op/queue when TF_MAX_PRIORITY == 1, restoring priority-agnostic codegen.
+  static constexpr unsigned _pindex(unsigned p) {
+    return p < TF_MAX_PRIORITY ? p : (TF_MAX_PRIORITY - 1);
+  }
+  template <typename A>
+  static bool _all_empty(const A& qs) {
+    for(unsigned p=0; p<TF_MAX_PRIORITY; ++p) {
+      if(!qs[p].empty()) return false;
+    }
+    return true;
+  }
+  template <typename A>
+  static Node* _pop_priority(A& qs) {
+    Node* t = nullptr;
+    for(unsigned p=0; p<TF_MAX_PRIORITY; ++p) {
+      if((t = qs[p].pop()) != nullptr) break;
+    }
+    return t;
+  }
+  Node* _steal_task(Worker&, size_t);
   void _set_up_topology(Worker*, Topology*);
   void _tear_down_topology(Worker&, Topology*, Node*&);
   void _tear_down_async(Worker&, Node*, Node*&);
@@ -1168,10 +1265,10 @@ requires (!std::same_as<std::decay_t<I>, AsyncTask>)
   void _bulk_schedule(I, size_t);
 
   template <typename I>
-  void _bulk_spill(I, size_t);
+  size_t _bulk_spill(I, size_t);
   
   template <typename I>
-  void _bulk_spill_round_robin(I, size_t);
+  size_t _bulk_spill_round_robin(I, size_t);
 
   template <size_t N>
   void _bulk_update_cache(Worker&, Node*&, Node*, std::array<Node*, N>&, size_t&);
@@ -1201,13 +1298,31 @@ requires (!std::same_as<std::decay_t<I>, AsyncTask>)
 
 // Constructor
 inline Executor::Executor(size_t N, std::shared_ptr<WorkerInterface> wif) :
+  Executor(N, 0, std::move(wif)) {
+}
+
+// Constructor
+inline Executor::Executor(size_t N, size_t num_reserved, std::shared_ptr<WorkerInterface> wif) :
   _workers  (N),
   _buffers  (std::bit_width(N)), // Empirically, we find that log2(N) performs best.
+#if TF_MAX_PRIORITY > 1
+  _num_reserved (num_reserved),
+  _notifier (N - (num_reserved < N ? num_reserved : 0)),
+  _hp_notifier (num_reserved < N ? num_reserved : 0) {
+#else
   _notifier (N) {
+  (void)num_reserved;  // priority scheduling compiled out; documented as ignored
+#endif
 
   if(N == 0) {
     TF_THROW("executor must define at least one worker");
   }
+
+#if TF_MAX_PRIORITY > 1
+  if(num_reserved >= N) {
+    TF_THROW("reserved workers (", num_reserved, ") must be fewer than workers (", N, ")");
+  }
+#endif
   
   // If spawning N threads fails, shut down any created threads before 
   // rethrowing the exception.
@@ -1246,8 +1361,11 @@ inline void Executor::_shutdown() {
   }
   
   _notifier.notify_all();
-  
-  // Only join the thread if it is joinable, as std::thread construction 
+#if TF_MAX_PRIORITY > 1
+  _hp_notifier.notify_all();
+#endif
+
+  // Only join the thread if it is joinable, as std::thread construction
   // may fail and throw an exception.
   for(auto& w : _workers) {
     if(w._thread.joinable()) {
@@ -1263,7 +1381,11 @@ inline size_t Executor::num_workers() const noexcept {
 
 // Function: num_waiters
 inline size_t Executor::num_waiters() const noexcept {
+#if TF_MAX_PRIORITY > 1
+  return _notifier.num_waiters() + _hp_notifier.num_waiters();
+#else
   return _notifier.num_waiters();
+#endif
 }
 
 // Function: num_queues
@@ -1364,9 +1486,69 @@ inline void Executor::_spawn(size_t N, std::shared_ptr<WorkerInterface> wif) {
   }
 }
 
+// Function: _steal_task
+//
+// Attempts to steal one task, using `vtm` as the victim hint, and updates
+// w._sticky_victim on success.
+//
+// With TF_MAX_PRIORITY == 1 this is the original single-victim steal, except
+// that the victim hint advances on success instead of pinning (see below).
+//
+// With TF_MAX_PRIORITY > 1 it is a priority-major sweep: probe every queue
+// (all workers, then all overflow buffers) at the highest priority level
+// before probing any queue at the next level, so priority is honored globally
+// across queues rather than within a single victim. The sweep starts at the
+// hinted victim and the hint is advanced by one on every successful steal.
+// Both properties are load-bearing for liveness: under saturation a pinned
+// victim never runs dry, so a task spilled into any other buffer would
+// otherwise never be seen (the workers never fail a steal, never re-pick a
+// victim, and never reach the _wait_for_task scans — observed as an
+// intermittent starvation "deadlock" of async().wait() from external
+// threads). The full sweep finds a higher-priority task as soon as any
+// worker frees up; the rotating start bounds how long equal-priority work
+// in another buffer can be overtaken.
+inline Node* Executor::_steal_task(Worker& w, size_t vtm) {
+#if TF_MAX_PRIORITY > 1
+  Node* t = nullptr;
+  const size_t W = _workers.size();
+  const size_t V = W + _buffers.size();
+  // reserved workers only ever take priority-0 tasks
+  const unsigned P = _is_reserved(w._id) ? 1u : unsigned(TF_MAX_PRIORITY);
+  for(unsigned p=0; p<P && !t; ++p) {
+    for(size_t k=0; k<V && !t; ++k) {
+      size_t v = vtm + k;
+      if(v >= V) {
+        v -= V;
+      }
+      t = (v < W) ? _workers[v]._wsq[p].steal()
+                  : _buffers[v - W].queue[p].steal();
+    }
+  }
+  if(t) {
+    w._sticky_victim = (vtm + 1 < V) ? vtm + 1 : 0;
+  }
+  return t;
+#else
+  Node* t = (vtm < _workers.size())
+    ? _workers[vtm]._wsq[0].steal()
+    : _buffers[vtm - _workers.size()].queue[0].steal();
+  if(t) {
+    // Advance (rather than pin) the victim hint on success — pinning starves:
+    // under saturation the pinned victim never runs dry, so no steal ever
+    // fails, the victim is never re-picked, and the _wait_for_task scans are
+    // never reached; a task spilled into any other buffer hangs forever
+    // (reproduced on this single-queue configuration too, ~1/60 stress runs).
+    // Costs one add per successful steal vs the original; re-check in the
+    // Phase 4 benchmark gate.
+    w._sticky_victim = (vtm + 1 < num_queues()) ? vtm + 1 : 0;
+  }
+  return t;
+#endif
+}
+
 // Function: _explore_task
 inline bool Executor::_explore_task(Worker& w, Node*& t) {
- 
+
   // Fast path: if no topologies are live, all queues are guaranteed empty
   // by the executor's invariant (num_topologies reaches zero only after all
   // nodes have been scheduled and their queues flushed). Skip the entire
@@ -1386,13 +1568,11 @@ inline bool Executor::_explore_task(Worker& w, Node*& t) {
   size_t vtm = w._sticky_victim;
  
   while(true) {
- 
-    t = (vtm < _workers.size())
-      ? _workers[vtm]._wsq.steal()
-      : _buffers[vtm - _workers.size()].queue.steal();
- 
+
+
+    t = _steal_task(w, vtm);
+
     if(t) {
-      w._sticky_victim = vtm;
       break;
     }
     
@@ -1475,12 +1655,84 @@ inline bool Executor::_explore_task(Worker& w, Node*& t) {
 inline void Executor::_exploit_task(Worker& w, Node*& t) {
   while(t) {
     _invoke(w, t);
-    t = w._wsq.pop();
+    t = _pop_priority(w._wsq);
   }
 }
 
+#if TF_MAX_PRIORITY > 1
+// Function: _wait_for_task_reserved
+//
+// The 2PC wait protocol for reserved high-priority workers. Mirrors
+// _wait_for_task with two deliberate differences: it waits on _hp_notifier
+// (see the note at the member — sharing the general notifier would let a
+// reserved worker consume a wakeup for lower-priority work it will not
+// execute, turning that wakeup into a lost one), and its empty-scans only
+// consider priority-0 queues, since those are the only queues it drains
+// (scanning more would spin it awake forever while lower-priority work
+// exists).
+inline bool Executor::_wait_for_task_reserved(Worker& w, Node*& t) {
+
+  const size_t hpid = w._id - (_workers.size() - _num_reserved);
+
+  explore_task:
+
+  if(_explore_task(w, t) == false) {
+    return false;
+  }
+
+  if(t) {
+    return true;
+  }
+
+  _hp_notifier.prepare_wait(hpid);
+
+  // Fast path: no live topologies implies no queued work at all.
+  if(_num_topologies.load(std::memory_order_relaxed) == 0) {
+    if(w._done.test(std::memory_order_relaxed)) {
+      _hp_notifier.cancel_wait(hpid);
+      return false;
+    }
+    _hp_notifier.commit_wait(hpid);
+    goto explore_task;
+  }
+
+  // Condition #1: buffers should hold no priority-0 work
+  for(size_t b=0; b<_buffers.size(); ++b) {
+    if(!_buffers[b].queue[0].empty()) {
+      _hp_notifier.cancel_wait(hpid);
+      w._sticky_victim = b + _workers.size();
+      goto explore_task;
+    }
+  }
+
+  // Condition #2: worker queues should hold no priority-0 work
+  for(size_t k=0; k<_workers.size()-1; ++k) {
+    if(size_t vtm = k + (k >= w._id); !_workers[vtm]._wsq[0].empty()) {
+      _hp_notifier.cancel_wait(hpid);
+      w._sticky_victim = vtm;
+      goto explore_task;
+    }
+  }
+
+  // Condition #3: worker should be alive
+  if(w._done.test(std::memory_order_relaxed)) {
+    _hp_notifier.cancel_wait(hpid);
+    return false;
+  }
+
+  _hp_notifier.commit_wait(hpid);
+  goto explore_task;
+}
+#endif
+
 // Function: _wait_for_task
 inline bool Executor::_wait_for_task(Worker& w, Node*& t) {
+
+#if TF_MAX_PRIORITY > 1
+  if(_is_reserved(w._id)) {
+    return _wait_for_task_reserved(w, t);
+  }
+#endif
 
   explore_task:
 
@@ -1510,10 +1762,10 @@ inline bool Executor::_wait_for_task(Worker& w, Node*& t) {
     _notifier.commit_wait(w._id);
     goto explore_task;
   }
-  
+
   // Condition #1: buffers should be empty
   for(size_t b=0; b<_buffers.size(); ++b) {
-    if(!_buffers[b].queue.empty()) {
+    if(!_all_empty(_buffers[b].queue)) {
       _notifier.cancel_wait(w._id);
       w._sticky_victim = b + _workers.size();
       goto explore_task;
@@ -1526,7 +1778,7 @@ inline bool Executor::_wait_for_task(Worker& w, Node*& t) {
   // Also, due to the property of a work-stealing queue, we don't need to check 
   // this worker's work-stealing queue.
   for(size_t k=0; k<_workers.size()-1; ++k) {
-    if(size_t vtm = k + (k >= w._id); !_workers[vtm]._wsq.empty()) {
+    if(size_t vtm = k + (k >= w._id); !_all_empty(_workers[vtm]._wsq)) {
       _notifier.cancel_wait(w._id);
       w._sticky_victim = vtm;
       goto explore_task;
@@ -1582,11 +1834,11 @@ inline size_t Executor::num_observers() const noexcept {
 
 // Procedure: _spill
 inline void Executor::_spill(Node* item) {
-  // Since pointers are aligned to 8 bytes, we perform a simple hash to avoid 
+  // Since pointers are aligned to 8 bytes, we perform a simple hash to avoid
   // contention caused by hashing to the same slot.
   auto b = (reinterpret_cast<uintptr_t>(item) >> 16) % _buffers.size();
   std::scoped_lock lock(_buffers[b].mutex);
-  _buffers[b].queue.push(item);
+  _buffers[b].queue[_pindex(item->_priority)].push(item);
 }
 
 // Procedure: _bulk_spill (single batch to one buffer)
@@ -1594,11 +1846,29 @@ inline void Executor::_spill(Node* item) {
 // providing better bit diffusion than the shift-based approach, especially
 // when the allocator returns pointers with regular low-bit patterns.
 template <typename I>
-void Executor::_bulk_spill(I first, size_t N) {
+size_t Executor::_bulk_spill(I first, size_t N) {
   //assert(N != 0);
   auto b = ((reinterpret_cast<uintptr_t>(*first) * 2654435761ULL) >> 32) % _buffers.size();
   std::scoped_lock lock(_buffers[b].mutex);
-  _buffers[b].queue.bulk_push(first, N);
+#if TF_MAX_PRIORITY <= 1
+  _buffers[b].queue[0].bulk_push(first, N);
+  return 0;
+#else
+  // A batch may contain mixed priorities, which cannot share a single bulk
+  // push, so route each node into its priority queue. Advance the iterator
+  // before pushing so we never dereference it after a pushed node may have run
+  // and torn down the underlying storage (see the note in _bulk_schedule).
+  // Returns the number of priority-0 nodes so callers can wake reserved workers.
+  size_t hp = 0;
+  for(size_t i=0; i<N; ++i) {
+    Node* node = *first;
+    ++first;
+    auto p = _pindex(node->_priority);
+    hp += (p == 0);
+    _buffers[b].queue[p].push(node);
+  }
+  return hp;
+#endif
 }
 
 // Procedure: _bulk_spill
@@ -1607,39 +1877,57 @@ void Executor::_bulk_spill(I first, size_t N) {
 // is held only for its chunk, reducing contention compared to sending the
 // entire batch to a single buffer.
 template <typename I>
-void Executor::_bulk_spill_round_robin(I first, size_t N) {
+size_t Executor::_bulk_spill_round_robin(I first, size_t N) {
 
   // assert(N != 0);
   const size_t B     = _buffers.size();
   const size_t start = ((reinterpret_cast<uintptr_t>(*first) * 2654435761ULL) >> 32) % B;
   const size_t per_buf = (N + B - 1) / B;
   size_t remaining = N;
+  size_t hp = 0;
   for(size_t i = 0; i < B && remaining > 0; ++i) {
     size_t b     = (start + i) % B;
     size_t chunk = std::min(per_buf, remaining);
     {
       std::scoped_lock lock(_buffers[b].mutex);
-      _buffers[b].queue.bulk_push(first, chunk);
+#if TF_MAX_PRIORITY <= 1
+      _buffers[b].queue[0].bulk_push(first, chunk);
+#else
+      for(size_t j=0; j<chunk; ++j) {
+        Node* node = *first;
+        ++first;
+        auto p = _pindex(node->_priority);
+        hp += (p == 0);
+        _buffers[b].queue[p].push(node);
+      }
+#endif
     }
     // terminates early via remaining > 0, so we don't acquire unnecessary locks on empty chunks.
     remaining -= chunk;
   }
+  return hp;
 }
 
 // Procedure: _schedule
 inline void Executor::_schedule(Worker& worker, Node* node) {
-  // starting at v3.5 we do not use any complicated notification mechanism 
+  // starting at v3.5 we do not use any complicated notification mechanism
   // as the experimental result has shown no significant advantage.
-  if(worker._wsq.try_push(node) == false) {
+  const auto p = _pindex(node->_priority);
+  // a reserved worker's local queues must stay pure priority-0, so it routes
+  // lower-priority work to the shared buffers where general workers find it
+  if((p > 0 && _is_reserved(worker._id)) || worker._wsq[p].try_push(node) == false) {
     _spill(node);
   }
   _notifier.notify_one();
+  _notify_hp(p == 0);
 }
 
 // Procedure: _schedule
 inline void Executor::_schedule(Node* node) {
+  const auto p = _pindex(node->_priority);
   _spill(node);
   _notifier.notify_one();
+  _notify_hp(p == 0);
 }
 
 // Procedure: _schedule
@@ -1651,16 +1939,37 @@ void Executor::_bulk_schedule(Worker& worker, I first, size_t num_nodes) {
   }
 
   // NOTE: We cannot use first/last in the for-loop (e.g., for(; first != last; ++first)).
-  // This is because when a node v is inserted into the queue, v can run and finish 
+  // This is because when a node v is inserted into the queue, v can run and finish
   // immediately. If v is the last node in the graph, it will tear down the parent task vector
   // which cause the last ++first to fail. This problem is specific to MSVC which has a stricter
   // iterator implementation in std::vector than GCC/Clang.
-  if(auto n = worker._wsq.try_bulk_push(first, num_nodes); n != num_nodes) {
+#if TF_MAX_PRIORITY <= 1
+  if(auto n = worker._wsq[0].try_bulk_push(first, num_nodes); n != num_nodes) {
     _bulk_spill(first, num_nodes - n);
   }
   _notifier.notify_n(num_nodes);
-    
-  // notify first before spilling to hopefully wake up workers earlier 
+#else
+  // A batch may contain mixed priorities, which cannot share a single bulk
+  // push, so route each node into its priority queue (spilling on overflow;
+  // reserved workers route all lower-priority work to the shared buffers).
+  // Advance the iterator before pushing (see NOTE above) so we never touch it
+  // after a pushed node may have run and freed the underlying storage.
+  size_t hp = 0;
+  const bool reserved = _is_reserved(worker._id);
+  for(size_t i=0; i<num_nodes; ++i) {
+    Node* node = *first;
+    ++first;
+    auto p = _pindex(node->_priority);
+    hp += (p == 0);
+    if((p > 0 && reserved) || worker._wsq[p].try_push(node) == false) {
+      _spill(node);
+    }
+  }
+  _notifier.notify_n(num_nodes);
+  _notify_hp(hp);
+#endif
+
+  // notify first before spilling to hopefully wake up workers earlier
   // however, the experiment does not show any benefit for doing this.
   //auto n = worker._wsq.try_bulk_push(first, num_nodes);
   //_notifier.notify_n(n);
@@ -1680,8 +1989,9 @@ inline void Executor::_bulk_schedule(I first, size_t num_nodes) {
   // immediately. If v is the last node in the graph, it will tear down the parent task vector
   // which cause the last ++first to fail. This problem is specific to MSVC which has a stricter
   // iterator implementation in std::vector than GCC/Clang.
-  _bulk_spill(first, num_nodes);
+  auto hp = _bulk_spill(first, num_nodes);
   _notifier.notify_n(num_nodes);
+  _notify_hp(hp);
 }
 
 // Function: _update_cache
@@ -2322,7 +2632,7 @@ void Executor::_corun_until(Worker& w, P&& stop_predicate) {
     
     // here we don't do while-loop to drain out the local queue as it can
     // potentially enter a very deep recursive corun, cuasing stack overflow
-    if(auto t = w._wsq.pop(); t) {
+    if(auto t = _pop_priority(w._wsq); t) {
       _invoke(w, t);
     }
     else {
@@ -2331,13 +2641,10 @@ void Executor::_corun_until(Worker& w, P&& stop_predicate) {
 
       explore:
 
-      t = (vtm < _workers.size()) 
-        ? _workers[vtm]._wsq.steal()
-        : _buffers[vtm-_workers.size()].queue.steal();
+      t = _steal_task(w, vtm);
 
       if(t) {
         _invoke(w, t);
-        w._sticky_victim = vtm;
         goto exploit;
       }
       else if(!stop_predicate()) {

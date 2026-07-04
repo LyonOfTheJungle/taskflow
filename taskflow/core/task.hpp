@@ -998,7 +998,29 @@ class Task {
 
   */
   Task& data(void* data);
-  
+
+  /**
+  @brief assigns a scheduling priority to the task
+
+  @param p the task priority (see tf::TaskPriority)
+  @return @c *this
+
+  A freed worker always picks a ready task of the highest available priority
+  first. Priority is a scheduling hint and does not preempt a running task.
+
+  @code{.cpp}
+  // render tasks jump ahead of background IO tasks in the queues
+  taskflow.emplace([](){ render(); }).priority(tf::TaskPriority::HIGH);
+  taskflow.emplace([](){ load();   }).priority(tf::TaskPriority::LOW);
+  @endcode
+  */
+  Task& priority(TaskPriority p);
+
+  /**
+  @brief queries the scheduling priority of the task (see tf::TaskPriority)
+  */
+  TaskPriority priority() const;
+
   /**
   @brief resets the task handle to null
 
@@ -1520,6 +1542,17 @@ inline void* Task::data() const {
 inline Task& Task::data(void* data) {
   _node->_data = data;
   return *this;
+}
+
+// Function: priority
+inline Task& Task::priority(TaskPriority p) {
+  _node->_priority = static_cast<unsigned>(p);
+  return *this;
+}
+
+// Function: priority
+inline TaskPriority Task::priority() const {
+  return static_cast<TaskPriority>(_node->_priority);
 }
 
 // ----------------------------------------------------------------------------

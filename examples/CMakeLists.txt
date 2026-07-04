@@ -34,6 +34,7 @@ list(APPEND TF_EXAMPLES
   composition
   limited_concurrency
   cancel
+  priority_scheduling
   exception
   subflow_exception
   worker_interface

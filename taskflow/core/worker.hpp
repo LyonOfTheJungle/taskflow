@@ -1,5 +1,7 @@
 #pragma once
 
+#include <array>
+
 #include "declarations.hpp"
 #include "wsq.hpp"
 #include "nonblocking_notifier.hpp"
@@ -74,13 +76,30 @@ class Worker {
   /**
   @brief queries the size of the queue (i.e., number of enqueued tasks to
          run) associated with the worker
+
+  The worker keeps one work-stealing queue per priority level; this returns the
+  total number of enqueued tasks summed across all levels.
   */
-  inline size_t queue_size() const { return _wsq.size(); }
-  
+  inline size_t queue_size() const {
+    size_t n = 0;
+    for(const auto& q : _wsq) {
+      n += q.size();
+    }
+    return n;
+  }
+
   /**
   @brief queries the current capacity of the queue
+
+  Returns the combined capacity of the per-priority work-stealing queues.
   */
-  inline size_t queue_capacity() const { return static_cast<size_t>(_wsq.capacity()); }
+  inline size_t queue_capacity() const {
+    size_t n = 0;
+    for(const auto& q : _wsq) {
+      n += static_cast<size_t>(q.capacity());
+    }
+    return n;
+  }
 
   /**
   @brief acquires the associated thread
@@ -93,9 +112,13 @@ class Worker {
 
   size_t _id;
   size_t _sticky_victim;
-  Xorshift<uint32_t> _rdgen; 
+  Xorshift<uint32_t> _rdgen;
   std::thread _thread;
-  wsq_type _wsq;
+
+  // one work-stealing queue per priority level (index 0 = highest priority).
+  // With TF_MAX_PRIORITY == 1 this is a single-element array whose per-priority
+  // loops fold away, matching the priority-agnostic single-queue codegen.
+  std::array<wsq_type, TF_MAX_PRIORITY> _wsq;
   //std::vector<Node*> _pool;
 };
 
@@ -159,12 +182,12 @@ inline size_t WorkerView::id() const {
 
 // Function: queue_size
 inline size_t WorkerView::queue_size() const {
-  return _worker._wsq.size();
+  return _worker.queue_size();
 }
 
 // Function: queue_capacity
 inline size_t WorkerView::queue_capacity() const {
-  return static_cast<size_t>(_worker._wsq.capacity());
+  return _worker.queue_capacity();
 }
 
 // ----------------------------------------------------------------------------
