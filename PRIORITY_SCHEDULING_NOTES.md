@@ -83,12 +83,51 @@ before any queue at priority 1**, etc., starting each sweep at a per-worker curs
   `TF_MAX_PRIORITY==1` builds (`_num_reserved` is `constexpr 0`, all branches fold away).
 - Reserved workers sweep only level 0 in `_steal_task`; their local queues stay pure
   priority-0 (`_schedule`/`_bulk_schedule` spill lower-priority pushes to the buffers).
-- **Separate notifier (`_hp_notifier`)**: reserved workers must never consume a wakeup
+- **Separate parking lot (`_hp_lot`)**: reserved workers must never consume a wakeup
   meant for lower-priority work (they would re-check only p0 queues and park again — a
-  genuine lost wakeup). Push sites notify `_notifier` always and `_hp_notifier` when
-  priority-0 work was scheduled (`_notify_hp`; bulk paths count p0 nodes, and
-  `_bulk_spill*` return that count). `_wait_for_task_reserved` mirrors the 2PC wait with
-  p0-only empty-scans; `_shutdown` notifies both notifiers.
+  genuine lost wakeup). Push sites notify `_notifier` always and the lot when priority-0
+  work was scheduled (`_notify_hp`; bulk paths count p0 nodes, and `_bulk_spill*` return
+  that count). The lot is a mutex/cv with a publish-then-rescan handshake (equivalent
+  no-lost-wakeup guarantee to the 2PC notifier) — chosen over the lock-free notifier
+  because the deadlock valve below needs *timed* waits; reserved workers park on the
+  cold path, so a mutex/cv costs nothing that matters.
+
+### The reserved-worker deadlock valve (found by downstream DUF/MeshLib load)
+Strict refusal of lower-priority work deadlocks the executor when every general worker
+is occupied by blocking work whose progress (transitively) depends on a pending
+default-priority task — canonical trigger: an external thread blocks in `run().wait()`
+while the general pool is saturated (MeshLib's off-worker `run_taskflow`). Reserving one
+worker shrinks the general pool from N to N−1, and the pending task's only free worker
+is the reserved one, which refuses it. Repro: with all N−1 general workers pinned by
+non-yielding NORMAL tasks, a non-worker `run().wait()` of a NORMAL task hung forever;
+with even one general worker free it completed.
+
+**Naive fix rejected**: "reserved workers fall back to lower work when no HIGH work
+exists" collapses reservation into a general worker (the priority-major sweep already
+makes every general worker prefer HIGH globally) — scenario (4) would regress from
+2 ms to ~40 ms, since between frames there is *always* lower work to fall into.
+
+**Key insight**: a deadlocked pool and a healthy saturated pool are indistinguishable by
+*pending work*; the discriminator is *progress*. Under the IO flood, general workers
+complete tasks constantly; in the deadlock, nothing completes. So:
+
+- Each worker counts invoked tasks (`Worker::_num_invokes`, relaxed, own cacheline,
+  bumped only when reservation is active; folds away entirely at `TF_MAX_PRIORITY==1`).
+- A reserved worker parks with a timeout (`TF_RESERVED_STALL_MS/2`, default 50 ms). On
+  each timeout it samples general progress; **two consecutive windows with zero general
+  progress while lower-priority work is pending** open the valve
+  (`Worker::_reserved_assist`): the worker steals lower-priority work like a general
+  worker (its `_steal_task`/corun scope widens with it, so it can also help drain a
+  blocked task's own children). The valve closes the moment general progress resumes.
+
+Verified: the fatal all-generals-blocked repro completes in ~220 ms (valve opens at
+~150 ms, assist streak drains at full speed — 200 stranded NORMAL tasks in ~215 ms);
+scenario (4) stays 2.03 ms avg / 2.10 ms max, 0/48 missed (A/B with the valve disabled
+via `TF_RESERVED_STALL_MS=100000` shows identical ~2 ms worst-case — the valve never
+opens under healthy load). Residual caveat: a workload whose every task runs longer
+than the detection window can open the valve spuriously; cost is bounded (one
+lower-priority task on the reserved worker, then strict again) and the window is
+tunable via `TF_RESERVED_STALL_MS`.
 
 ---
 

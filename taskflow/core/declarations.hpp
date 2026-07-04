@@ -18,6 +18,23 @@ every value of tf::TaskPriority you intend to use.
   #define TF_MAX_PRIORITY 3
 #endif
 
+/**
+@def TF_RESERVED_STALL_MS
+
+@brief detection window (milliseconds) of the reserved-worker deadlock valve
+
+A reserved high-priority worker normally refuses all lower-priority work. If
+the general workers make no progress for roughly this long while
+lower-priority work is pending and the reserved worker sits idle, the reserved
+worker temporarily assists with lower-priority work, reverting to strict
+high-only the moment the general pool progresses again. This prevents a hard
+deadlock when every general worker is occupied by blocking work whose progress
+(transitively) depends on a pending default-priority task.
+*/
+#ifndef TF_RESERVED_STALL_MS
+  #define TF_RESERVED_STALL_MS 100
+#endif
+
 namespace tf {
 
 // ----------------------------------------------------------------------------

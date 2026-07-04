@@ -1,5 +1,8 @@
 #pragma once
 
+#include <chrono>
+#include <condition_variable>
+
 #include "../observer/tfprof.hpp"
 #include "taskflow.hpp"
 #include "async_task.hpp"
@@ -118,7 +121,13 @@ class Executor {
   @attention
   Reserved capacity trades throughput for latency: a reserved worker
   contributes nothing to lower-priority work even when the executor is
-  saturated with it. On a build with `TF_MAX_PRIORITY == 1` (priority
+  saturated with it. One safety valve softens this: if the general workers
+  make no progress at all for about @c TF_RESERVED_STALL_MS milliseconds while
+  lower-priority work is pending (i.e., the pool is deadlocked — for example,
+  an external thread blocks in run().wait() while every general worker is
+  occupied by blocking work), an idle reserved worker temporarily assists with
+  lower-priority work and returns to strict high-only the moment the general
+  pool progresses again. On a build with `TF_MAX_PRIORITY == 1` (priority
   scheduling compiled out) @c num_reserved is ignored and all workers behave
   as general workers.
   */
@@ -1163,11 +1172,20 @@ requires (!std::same_as<std::decay_t<I>, AsyncTask>)
   // or the false sharing can cause serious performance drop
   alignas(TF_CACHELINE_SIZE) DefaultNotifier _notifier;
 #if TF_MAX_PRIORITY > 1
-  // Reserved workers sleep on their own notifier: they only execute
+  // Reserved workers sleep on their own parking lot: they only execute
   // priority-0 work, so a wakeup for lower-priority work must never be
   // consumed by them (the woken reserved worker would re-check only
   // priority-0 queues and go back to sleep, losing the wakeup for good).
-  alignas(TF_CACHELINE_SIZE) DefaultNotifier _hp_notifier;
+  // Unlike the general notifier this lot supports timed waits, which the
+  // stall-detection deadlock valve needs (see _wait_for_task_reserved).
+  // Reserved workers are few and park on the cold path, so a mutex/cv is fine.
+  struct ReservedLot {
+    std::mutex mtx;
+    std::condition_variable cv;
+    uint64_t epoch {0};                // guarded by mtx
+    std::atomic<int> num_parked {0};
+  };
+  alignas(TF_CACHELINE_SIZE) ReservedLot _hp_lot;
 #endif
   alignas(TF_CACHELINE_SIZE) std::atomic<size_t> _num_topologies {0};
   
@@ -1191,14 +1209,48 @@ requires (!std::same_as<std::decay_t<I>, AsyncTask>)
     return wid >= _workers.size() - _num_reserved;
   }
 
-  // wakes up to `count` reserved workers after priority-0 work was scheduled
+  // wakes reserved workers after priority-0 work was scheduled
 #if TF_MAX_PRIORITY > 1
   void _notify_hp(size_t count) {
     if(_num_reserved && count) {
-      count == 1 ? _hp_notifier.notify_one() : _hp_notifier.notify_n(count);
+      // pairs with the publish-then-rescan in _wait_for_task_reserved: either
+      // we observe the parked reserved worker here, or its post-publish rescan
+      // observes the pushed priority-0 task — no lost wakeup either way
+      std::atomic_thread_fence(std::memory_order_seq_cst);
+      if(_hp_lot.num_parked.load(std::memory_order_relaxed) > 0) {
+        {
+          std::scoped_lock lock(_hp_lot.mtx);
+          ++_hp_lot.epoch;
+        }
+        _hp_lot.cv.notify_all();
+      }
     }
   }
   bool _wait_for_task_reserved(Worker&, Node*&);
+  // total tasks invoked by general workers — the progress signal sampled by
+  // idle reserved workers for stall (deadlock) detection
+  uint64_t _general_progress() const {
+    uint64_t sum = 0;
+    for(size_t i = 0, n = _workers.size() - _num_reserved; i < n; ++i) {
+      sum += _workers[i]._num_invokes.load(std::memory_order_relaxed);
+    }
+    return sum;
+  }
+  // whether any lower-priority (p > 0) work is queued anywhere a thief can reach
+  bool _lower_pending() const {
+    for(size_t b = 0; b < _buffers.size(); ++b) {
+      for(unsigned p = 1; p < TF_MAX_PRIORITY; ++p) {
+        if(!_buffers[b].queue[p].empty()) return true;
+      }
+    }
+    // reserved workers' local queues stay pure priority-0, skip them
+    for(size_t i = 0, n = _workers.size() - _num_reserved; i < n; ++i) {
+      for(unsigned p = 1; p < TF_MAX_PRIORITY; ++p) {
+        if(!_workers[i]._wsq[p].empty()) return true;
+      }
+    }
+    return false;
+  }
 #else
   void _notify_hp(size_t) {}
 #endif
@@ -1307,8 +1359,7 @@ inline Executor::Executor(size_t N, size_t num_reserved, std::shared_ptr<WorkerI
   _buffers  (std::bit_width(N)), // Empirically, we find that log2(N) performs best.
 #if TF_MAX_PRIORITY > 1
   _num_reserved (num_reserved),
-  _notifier (N - (num_reserved < N ? num_reserved : 0)),
-  _hp_notifier (num_reserved < N ? num_reserved : 0) {
+  _notifier (N - (num_reserved < N ? num_reserved : 0)) {
 #else
   _notifier (N) {
   (void)num_reserved;  // priority scheduling compiled out; documented as ignored
@@ -1362,7 +1413,11 @@ inline void Executor::_shutdown() {
   
   _notifier.notify_all();
 #if TF_MAX_PRIORITY > 1
-  _hp_notifier.notify_all();
+  {
+    std::scoped_lock lock(_hp_lot.mtx);
+    ++_hp_lot.epoch;
+  }
+  _hp_lot.cv.notify_all();
 #endif
 
   // Only join the thread if it is joinable, as std::thread construction
@@ -1382,7 +1437,8 @@ inline size_t Executor::num_workers() const noexcept {
 // Function: num_waiters
 inline size_t Executor::num_waiters() const noexcept {
 #if TF_MAX_PRIORITY > 1
-  return _notifier.num_waiters() + _hp_notifier.num_waiters();
+  return _notifier.num_waiters()
+       + static_cast<size_t>(_hp_lot.num_parked.load(std::memory_order_relaxed));
 #else
   return _notifier.num_waiters();
 #endif
@@ -1512,8 +1568,11 @@ inline Node* Executor::_steal_task(Worker& w, size_t vtm) {
   Node* t = nullptr;
   const size_t W = _workers.size();
   const size_t V = W + _buffers.size();
-  // reserved workers only ever take priority-0 tasks
-  const unsigned P = _is_reserved(w._id) ? 1u : unsigned(TF_MAX_PRIORITY);
+  // reserved workers only take priority-0 tasks, unless the deadlock valve
+  // is open (see _wait_for_task_reserved), in which case they assist with
+  // lower-priority work like a general worker
+  const unsigned P =
+    (_is_reserved(w._id) && !w._reserved_assist) ? 1u : unsigned(TF_MAX_PRIORITY);
   for(unsigned p=0; p<P && !t; ++p) {
     for(size_t k=0; k<V && !t; ++k) {
       size_t v = vtm + k;
@@ -1662,21 +1721,50 @@ inline void Executor::_exploit_task(Worker& w, Node*& t) {
 #if TF_MAX_PRIORITY > 1
 // Function: _wait_for_task_reserved
 //
-// The 2PC wait protocol for reserved high-priority workers. Mirrors
-// _wait_for_task with two deliberate differences: it waits on _hp_notifier
-// (see the note at the member — sharing the general notifier would let a
-// reserved worker consume a wakeup for lower-priority work it will not
-// execute, turning that wakeup into a lost one), and its empty-scans only
-// consider priority-0 queues, since those are the only queues it drains
-// (scanning more would spin it awake forever while lower-priority work
-// exists).
+// The wait protocol for reserved high-priority workers. It differs from the
+// general _wait_for_task in three deliberate ways:
+//
+// 1. It waits on the reserved parking lot, not the general notifier — sharing
+//    the general notifier would let a reserved worker consume a wakeup for
+//    lower-priority work it will not execute, turning it into a lost wakeup.
+//    The lot's publish-then-rescan handshake with _notify_hp gives the same
+//    no-lost-wakeup guarantee as the 2PC notifier for priority-0 pushes.
+//
+// 2. Its empty-scan only considers priority-0 queues, since those are the
+//    only queues it drains in strict mode (scanning more would spin it awake
+//    forever while lower-priority work exists).
+//
+// 3. The park is TIMED, feeding a deadlock valve: strict refusal of
+//    lower-priority work deadlocks the executor when every general worker is
+//    occupied by blocking work whose progress (transitively) depends on a
+//    pending default-priority task — e.g. an external thread's run().wait()
+//    with the general pool saturated. A deadlock is indistinguishable from a
+//    healthy saturated pool by *pending work*; the discriminator is
+//    *progress*. So: if the general workers invoke nothing for two
+//    consecutive detection windows while lower-priority work is pending and
+//    this worker sits idle, the valve opens (w._reserved_assist) and this
+//    worker helps with lower-priority work like a general worker. The valve
+//    closes the moment general progress resumes, restoring the strict
+//    latency guarantee. Under a healthy saturated load (tasks completing
+//    continuously) the valve never opens and reservation is unaffected.
 inline bool Executor::_wait_for_task_reserved(Worker& w, Node*& t) {
 
-  const size_t hpid = w._id - (_workers.size() - _num_reserved);
+  constexpr auto POLL = std::chrono::milliseconds(
+    TF_RESERVED_STALL_MS / 2 > 0 ? TF_RESERVED_STALL_MS / 2 : 1
+  );
+
+  int stalls = 0;
+  uint64_t progress = _general_progress();
 
   explore_task:
 
+  // assist ends as soon as the general pool progresses on its own
+  if(w._reserved_assist && _general_progress() != w._assist_baseline) {
+    w._reserved_assist = false;
+  }
+
   if(_explore_task(w, t) == false) {
+    w._reserved_assist = false;
     return false;
   }
 
@@ -1684,43 +1772,63 @@ inline bool Executor::_wait_for_task_reserved(Worker& w, Node*& t) {
     return true;
   }
 
-  _hp_notifier.prepare_wait(hpid);
+  // nothing stealable in scope — park (timed) on the reserved lot
+  w._reserved_assist = false;
 
-  // Fast path: no live topologies implies no queued work at all.
-  if(_num_topologies.load(std::memory_order_relaxed) == 0) {
+  uint64_t e;
+  {
+    std::scoped_lock lock(_hp_lot.mtx);
+    e = _hp_lot.epoch;
+  }
+  _hp_lot.num_parked.fetch_add(1, std::memory_order_seq_cst);
+
+  // Recheck priority-0 work AFTER publishing num_parked (pairs with the
+  // fence + num_parked load in _notify_hp): either the pusher sees us parked
+  // and bumps the epoch, or this rescan sees its pushed task.
+  std::atomic_thread_fence(std::memory_order_seq_cst);
+  bool have_p0 = false;
+  for(size_t b = 0; b < _buffers.size() && !have_p0; ++b) {
+    have_p0 = !_buffers[b].queue[0].empty();
+  }
+  for(size_t k = 0; k < _workers.size() - 1 && !have_p0; ++k) {
+    size_t vtm = k + (k >= w._id);
+    have_p0 = !_workers[vtm]._wsq[0].empty();
+  }
+  if(have_p0 || w._done.test(std::memory_order_relaxed)) {
+    _hp_lot.num_parked.fetch_sub(1, std::memory_order_relaxed);
     if(w._done.test(std::memory_order_relaxed)) {
-      _hp_notifier.cancel_wait(hpid);
       return false;
     }
-    _hp_notifier.commit_wait(hpid);
+    stalls = 0;
     goto explore_task;
   }
 
-  // Condition #1: buffers should hold no priority-0 work
-  for(size_t b=0; b<_buffers.size(); ++b) {
-    if(!_buffers[b].queue[0].empty()) {
-      _hp_notifier.cancel_wait(hpid);
-      w._sticky_victim = b + _workers.size();
-      goto explore_task;
-    }
+  bool signaled;
+  {
+    std::unique_lock lock(_hp_lot.mtx);
+    signaled = _hp_lot.cv.wait_for(lock, POLL, [&]{ return _hp_lot.epoch != e; });
   }
+  _hp_lot.num_parked.fetch_sub(1, std::memory_order_relaxed);
 
-  // Condition #2: worker queues should hold no priority-0 work
-  for(size_t k=0; k<_workers.size()-1; ++k) {
-    if(size_t vtm = k + (k >= w._id); !_workers[vtm]._wsq[0].empty()) {
-      _hp_notifier.cancel_wait(hpid);
-      w._sticky_victim = vtm;
-      goto explore_task;
-    }
-  }
-
-  // Condition #3: worker should be alive
   if(w._done.test(std::memory_order_relaxed)) {
-    _hp_notifier.cancel_wait(hpid);
     return false;
   }
 
-  _hp_notifier.commit_wait(hpid);
+  if(signaled) {  // priority-0 work arrived (or shutdown)
+    stalls = 0;
+    goto explore_task;
+  }
+
+  // timed out — deadlock-valve stall detection
+  if(uint64_t p = _general_progress(); p != progress || !_lower_pending()) {
+    progress = p;
+    stalls = 0;
+  }
+  else if(++stalls >= 2) {
+    stalls = 0;
+    w._assist_baseline = progress;
+    w._reserved_assist = true;
+  }
   goto explore_task;
 }
 #endif
@@ -2028,6 +2136,14 @@ inline void Executor::_invoke(Worker& worker, Node* node) {
   }
 
   begin_invoke:
+
+#if TF_MAX_PRIORITY > 1
+  // progress signal for the reserved-worker deadlock valve; only maintained
+  // while reservation is active (folds away entirely at TF_MAX_PRIORITY == 1)
+  if(_num_reserved) {
+    worker._num_invokes.fetch_add(1, std::memory_order_relaxed);
+  }
+#endif
 
   Node* cache {nullptr};
   

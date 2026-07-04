@@ -115,6 +115,17 @@ class Worker {
   Xorshift<uint32_t> _rdgen;
   std::thread _thread;
 
+#if TF_MAX_PRIORITY > 1
+  // reserved-worker deadlock-valve state (see Executor::_wait_for_task_reserved):
+  // while _reserved_assist is true a reserved worker steals lower-priority work
+  // too; _assist_baseline is the general-progress snapshot at valve opening.
+  bool _reserved_assist {false};
+  uint64_t _assist_baseline {0};
+  // monotonic count of tasks invoked by this worker; sampled by idle reserved
+  // workers to detect scheduler-wide stalls (only bumped when reservation is on)
+  std::atomic<uint64_t> _num_invokes {0};
+#endif
+
   // one work-stealing queue per priority level (index 0 = highest priority).
   // With TF_MAX_PRIORITY == 1 this is a single-element array whose per-priority
   // loops fold away, matching the priority-agnostic single-queue codegen.
