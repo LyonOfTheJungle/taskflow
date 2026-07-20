@@ -35,6 +35,7 @@ list(APPEND TF_EXAMPLES
   limited_concurrency
   cancel
   priority_scheduling
+  isolation
   exception
   subflow_exception
   worker_interface

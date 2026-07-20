@@ -308,7 +308,14 @@ class Topology : public NodeBase {
 
   std::function<bool()> _predicate;
   std::function<void()> _on_finish;
-  
+
+#if TF_ISOLATION
+  // isolation scope active on the submitting thread at run() time; stamped
+  // onto the topology's nodes at every set-up, including repeat runs and
+  // queued topologies that are set up later by unrelated workers.
+  IsolationScope* _isolation {nullptr};
+#endif
+
   void _carry_out_promise();
 };
 
@@ -525,6 +532,14 @@ class Node : public NodeBase {
   // scheduling priority; lower value = higher priority (see tf::TaskPriority).
   // routed by the executor into the matching per-priority work-stealing queue.
   unsigned _priority {static_cast<unsigned>(TaskPriority::NORMAL)};
+
+#if TF_ISOLATION
+  // isolation scope this node belongs to (nullptr = none). Stamped when the
+  // node is set up for scheduling (graph setup / async creation) from the
+  // stamping thread's current scope; routed by the executor into the scope's
+  // queue and adopted by the invoking worker for the task's duration.
+  IsolationScope* _isolation {nullptr};
+#endif
 
   Topology* _topology {nullptr};
 

@@ -11,26 +11,36 @@ namespace tf {
 
 // Procedure: _schedule_async_task
 template <typename... ArgsT>
-void Executor::_schedule_async_task(ArgsT&&... args) {  
+void Executor::_schedule_async_task(ArgsT&&... args) {
+  auto node = animate(std::forward<ArgsT>(args)...);
+#if TF_ISOLATION
+  // async tasks inherit the spawning thread's isolation scope
+  node->_isolation = pt::this_isolation;
+#endif
   // caller is a worker of the executor
   if(auto w = this_worker(); w) {
-    // We don't do per-worker cache as it can cause bugs in corun that are very difficult to 
+    // We don't do per-worker cache as it can cause bugs in corun that are very difficult to
     // track. For example, when a worker invokes an async task and then immediately enter corun,
     // it becomes very difficult to get the task out of its cache correctly.
-    _schedule(*w, animate(std::forward<ArgsT>(args)...));
+    _schedule(*w, node);
   }
   // caller is a freelance thread
   else{
-    _schedule(animate(std::forward<ArgsT>(args)...));
+    _schedule(node);
   }
 }
 
 // Procedure: _schedule_dependent_async_task
 template <typename I, typename... ArgsT>
-AsyncTask Executor::_schedule_dependent_async_task(I first, I last, size_t num_predecessors, ArgsT&&... args) {  
-    
+AsyncTask Executor::_schedule_dependent_async_task(I first, I last, size_t num_predecessors, ArgsT&&... args) {
+
   // We need to create an async-task first to acquire an ownership.
   AsyncTask task(animate(std::forward<ArgsT>(args)...));
+#if TF_ISOLATION
+  // stamp at creation: a dependent async may be scheduled later by whichever
+  // worker completes its last predecessor, whose scope is unrelated
+  task._node->_isolation = pt::this_isolation;
+#endif
 
   for(; first != last; first++) {
     auto&& x = *first;

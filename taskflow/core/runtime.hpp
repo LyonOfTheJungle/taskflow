@@ -964,6 +964,11 @@ tf::Future<void> Executor::run_until(Taskflow&& f, P&& p, C&& c) {
   auto t = std::make_shared<Topology>(*g, std::forward<P>(p), std::forward<C>(c));
   //auto t = std::make_shared<DerivedTopology<P, C>>(*g, std::forward<P>(p), std::forward<C>(c));
 
+#if TF_ISOLATION
+  // capture the submitting thread's isolation scope (see Executor::run_until)
+  t->_isolation = pt::this_isolation;
+#endif
+
   // need to create future before the topology got torn down quickly
   tf::Future<void> future(t->_promise.get_future(), t);
 

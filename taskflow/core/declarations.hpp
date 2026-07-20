@@ -35,6 +35,28 @@ deadlock when every general worker is occupied by blocking work whose progress
   #define TF_RESERVED_STALL_MS 100
 #endif
 
+/**
+@def TF_ISOLATION
+
+@brief compile-time gate for work-stealing isolation scopes
+
+When enabled (the default), tf::Executor::make_isolation_scope() and
+tf::Executor::isolate() provide TBB-style isolation: tasks belonging to an
+isolation scope live in the scope's own queue, workers executing scope work
+adopt the scope for the duration (including their nested corun stealing,
+which is then confined to the scope), and free workers may still help with
+any scope's work. This is the primitive that makes "several threads join a
+computation without ever stealing unrelated outer tasks" deadlock-free on a
+single executor.
+
+Defining @c TF_ISOLATION to @c 0 removes the per-node scope pointer, all
+scope queues, and every hot-path check, restoring the exact pre-isolation
+codegen.
+*/
+#ifndef TF_ISOLATION
+  #define TF_ISOLATION 1
+#endif
+
 namespace tf {
 
 // ----------------------------------------------------------------------------
@@ -93,6 +115,9 @@ class ChromeTracingObserver;
 class TFProfObserver;
 class TFProfManager;
 class ExplicitAnchorGuard;
+#if TF_ISOLATION
+class IsolationScope;
+#endif
 
 template <typename T>
 class Future;

@@ -6,6 +6,7 @@
 #include "../observer/tfprof.hpp"
 #include "taskflow.hpp"
 #include "async_task.hpp"
+#include "isolation.hpp"
 
 /**
 @file executor.hpp
@@ -1144,8 +1145,54 @@ requires (!std::same_as<std::decay_t<I>, AsyncTask>)
   */
   TaskGroup task_group();
 
+#if TF_ISOLATION
+  /**
+  @brief creates a work-stealing isolation scope on this executor
+
+  @return a shared handle to a tf::IsolationScope
+
+  Tasks spawned while a thread runs under the scope (see tf::Executor::isolate)
+  are confined to the scope: workers executing or corunning them can only
+  steal work belonging to the same scope, while free workers may still help
+  with the scope's work. This provides TBB-style
+  `task_arena`/`this_task_arena::isolate` semantics on a single executor —
+  the primitive needed to let many threads join a shared computation (e.g. a
+  lazily built cache) without ever stealing an unrelated outer task that may
+  itself wait on that computation (the re-entrant self-steal deadlock).
+
+  All work spawned under the scope must be joined before the last handle is
+  released (the same rule as tf::TaskGroup::corun). The scope must not
+  outlive the executor. Scope storage is pooled internally, so releasing a
+  handle is safe against concurrently sweeping helper workers.
+
+  Throws if more than 64 scopes are active at once on this executor.
+  */
+  std::shared_ptr<IsolationScope> make_isolation_scope();
+
+  /**
+  @brief runs a callable under an isolation scope on the calling thread
+
+  @param scope an active scope obtained from tf::Executor::make_isolation_scope
+  @param f the callable to run
+
+  @return the return value of the callable
+
+  While @c f runs, every task it spawns (directly or transitively: corun
+  graphs, subflows, asyncs, task groups) is stamped with the scope and routed
+  to the scope's queue, and any corun issued on this thread only executes the
+  scope's work. Callable from workers and non-workers alike; on a non-worker
+  the effect is limited to stamping submitted work (a non-worker never
+  steals). Nesting is supported: the previous scope is restored on exit.
+  */
+  template <typename F>
+  auto isolate(IsolationScope& scope, F&& f) {
+    ScopedIsolation _guard(&scope);
+    return std::forward<F>(f)();
+  }
+#endif
+
   private:
-  
+
   struct Buffer {
     std::mutex mutex;
     // one overflow queue per priority level so spilled tasks keep their
@@ -1155,6 +1202,19 @@ requires (!std::same_as<std::decay_t<I>, AsyncTask>)
   
   std::vector<Worker> _workers;
   std::vector<Buffer> _buffers;
+
+#if TF_ISOLATION
+  // Fixed-slot registry of active isolation scopes, swept by helper workers.
+  // Scope storage is pooled and never freed while the executor lives, so a
+  // sweep racing a scope release touches valid memory at worst (it may steal
+  // from the slot's next tenant — always legal for a helper). _num_scopes is
+  // the fast-path gate: zero active scopes costs one relaxed load.
+  static constexpr size_t MAX_ISOLATION_SCOPES = 64;
+  std::array<std::atomic<IsolationScope*>, MAX_ISOLATION_SCOPES> _scopes {};
+  std::atomic<size_t> _num_scopes {0};
+  std::mutex _scope_pool_mutex;
+  std::vector<std::unique_ptr<IsolationScope>> _scope_pool;
+#endif
 
 #if TF_MAX_PRIORITY > 1
   // number of reserved high-priority workers (see the reserved-capacity
@@ -1203,6 +1263,14 @@ requires (!std::same_as<std::decay_t<I>, AsyncTask>)
   void _schedule_graph(Worker&, Graph&, Topology*, NodeBase*);
   void _spill(Node*);
 
+#if TF_ISOLATION
+  void _schedule_isolated(Node*);
+  Node* _steal_isolated(Worker&);
+  bool _any_isolated_pending() const;
+  template <typename P>
+  void _corun_until_isolated(Worker&, IsolationScope*, P&&);
+#endif
+
   // true if the worker id belongs to a reserved high-priority worker;
   // folds to false when TF_MAX_PRIORITY == 1 (_num_reserved is constexpr 0)
   bool _is_reserved(size_t wid) const noexcept {
@@ -1249,6 +1317,11 @@ requires (!std::same_as<std::decay_t<I>, AsyncTask>)
         if(!_workers[i]._wsq[p].empty()) return true;
       }
     }
+#if TF_ISOLATION
+    // stranded isolated work must also open the deadlock valve — a strict
+    // reserved worker refuses it just like lower-priority work
+    if(_any_isolated_pending()) return true;
+#endif
     return false;
   }
 #else
@@ -1631,10 +1704,18 @@ inline bool Executor::_explore_task(Worker& w, Node*& t) {
 
     t = _steal_task(w, vtm);
 
+#if TF_ISOLATION
+    // regular queues empty: help any active isolation scope — this is what
+    // lets a scoped computation use the executor's full parallelism
+    if(t == nullptr) {
+      t = _steal_isolated(w);
+    }
+#endif
+
     if(t) {
       break;
     }
-    
+
     // EMPTY: pick a new victim excluding self since our own queue is likely empty.
     // map [0, MAX_VICTIM-1) over [0, MAX_VICTIM) \ {w._id} — always safe since MAX_VICTIM >= 2.
     vtm = w._rdgen() % (MAX_VICTIM - 1);
@@ -1879,6 +1960,16 @@ inline bool Executor::_wait_for_task(Worker& w, Node*& t) {
       goto explore_task;
     }
   }
+
+#if TF_ISOLATION
+  // Condition #1.5: no isolation scope has pending work — otherwise a helper
+  // parking here could strand a scoped computation whose only awake threads
+  // are its own (spinning) corunners
+  if(_any_isolated_pending()) {
+    _notifier.cancel_wait(w._id);
+    goto explore_task;
+  }
+#endif
   
   // Condition #2: worker queues should be empty
   // Note: We need to use index-based looping to avoid data race with _spawn
@@ -2018,6 +2109,14 @@ size_t Executor::_bulk_spill_round_robin(I first, size_t N) {
 
 // Procedure: _schedule
 inline void Executor::_schedule(Worker& worker, Node* node) {
+#if TF_ISOLATION
+  // isolated tasks live in their scope's queue only: they must neither block
+  // behind outer work nor be popped by a worker corunning under another scope
+  if(node->_isolation) {
+    _schedule_isolated(node);
+    return;
+  }
+#endif
   // starting at v3.5 we do not use any complicated notification mechanism
   // as the experimental result has shown no significant advantage.
   const auto p = _pindex(node->_priority);
@@ -2032,11 +2131,125 @@ inline void Executor::_schedule(Worker& worker, Node* node) {
 
 // Procedure: _schedule
 inline void Executor::_schedule(Node* node) {
+#if TF_ISOLATION
+  if(node->_isolation) {
+    _schedule_isolated(node);
+    return;
+  }
+#endif
   const auto p = _pindex(node->_priority);
   _spill(node);
   _notifier.notify_one();
   _notify_hp(p == 0);
 }
+
+#if TF_ISOLATION
+// Procedure: _schedule_isolated
+//
+// Pushes an isolation-scoped node into its scope's queue. Like the overflow
+// buffers, push is mutex-serialized (multiple producers) and steal is the
+// lock-free thief-side operation. Reserved workers are not notified via the
+// HP lot: isolated work is ordinary work to them and is only picked up when
+// the deadlock valve widens their sweep.
+inline void Executor::_schedule_isolated(Node* node) {
+  auto s = node->_isolation;
+  {
+    std::scoped_lock lock(s->_mutex);
+    s->_queue.push(node);
+  }
+  _notifier.notify_one();
+}
+
+// Function: _steal_isolated
+//
+// Sweeps the active isolation scopes and steals one task, if any. Used by
+// free (non-isolated) workers as helpers after the regular queues came up
+// empty. Strict reserved workers skip isolated work entirely — assisting is
+// only allowed when the deadlock valve is open, mirroring their treatment of
+// lower-priority work.
+inline Node* Executor::_steal_isolated(Worker& w) {
+  if(_num_scopes.load(std::memory_order_relaxed) == 0) {
+    return nullptr;
+  }
+#if TF_MAX_PRIORITY > 1
+  if(_is_reserved(w._id) && !w._reserved_assist) {
+    return nullptr;
+  }
+#else
+  (void)w;
+#endif
+  for(size_t i = 0; i < MAX_ISOLATION_SCOPES; ++i) {
+    if(auto* s = _scopes[i].load(std::memory_order_acquire); s) {
+      if(auto t = s->_queue.steal(); t) {
+        return t;
+      }
+    }
+  }
+  return nullptr;
+}
+
+// Function: _any_isolated_pending
+inline bool Executor::_any_isolated_pending() const {
+  if(_num_scopes.load(std::memory_order_relaxed) == 0) {
+    return false;
+  }
+  for(size_t i = 0; i < MAX_ISOLATION_SCOPES; ++i) {
+    if(auto* s = _scopes[i].load(std::memory_order_acquire); s && !s->_queue.empty()) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Function: make_isolation_scope
+inline std::shared_ptr<IsolationScope> Executor::make_isolation_scope() {
+
+  // reuse pooled storage when available so releasing a scope handle is safe
+  // against helpers concurrently sweeping the registry (memory stays valid
+  // for the executor's lifetime)
+  IsolationScope* s = nullptr;
+  {
+    std::scoped_lock lock(_scope_pool_mutex);
+    if(!_scope_pool.empty()) {
+      s = _scope_pool.back().release();
+      _scope_pool.pop_back();
+    }
+  }
+  if(s == nullptr) {
+    s = new IsolationScope();
+  }
+
+  // claim a registry slot
+  size_t slot = MAX_ISOLATION_SCOPES;
+  for(size_t i = 0; i < MAX_ISOLATION_SCOPES; ++i) {
+    IsolationScope* expected = nullptr;
+    if(_scopes[i].compare_exchange_strong(
+        expected, s, std::memory_order_acq_rel, std::memory_order_relaxed)) {
+      slot = i;
+      break;
+    }
+  }
+  if(slot == MAX_ISOLATION_SCOPES) {
+    {
+      std::scoped_lock lock(_scope_pool_mutex);
+      _scope_pool.emplace_back(s);
+    }
+    TF_THROW("exceeded the maximum number of concurrent isolation scopes");
+  }
+  s->_slot = slot;
+  _num_scopes.fetch_add(1, std::memory_order_release);
+
+  return std::shared_ptr<IsolationScope>(s, [this](IsolationScope* p) {
+    // all scope work must have been joined by now (documented contract);
+    // unpublish the slot first so helpers stop finding it, then pool the
+    // storage for reuse — never freed while the executor lives
+    _scopes[p->_slot].store(nullptr, std::memory_order_release);
+    _num_scopes.fetch_sub(1, std::memory_order_release);
+    std::scoped_lock lock(_scope_pool_mutex);
+    _scope_pool.emplace_back(p);
+  });
+}
+#endif  // TF_ISOLATION
 
 // Procedure: _schedule
 template <typename I>
@@ -2052,6 +2265,26 @@ void Executor::_bulk_schedule(Worker& worker, I first, size_t num_nodes) {
   // which cause the last ++first to fail. This problem is specific to MSVC which has a stricter
   // iterator implementation in std::vector than GCC/Clang.
 #if TF_MAX_PRIORITY <= 1
+#if TF_ISOLATION
+  // isolated nodes must go to their scope queue, which the bulk push cannot
+  // do; fall back to per-node routing while any scope is active (a batch is
+  // scope-homogeneous in practice, but check per node for safety)
+  if(_num_scopes.load(std::memory_order_relaxed) > 0) {
+    for(size_t i=0; i<num_nodes; ++i) {
+      Node* node = *first;
+      ++first;
+      if(node->_isolation) {
+        std::scoped_lock lock(node->_isolation->_mutex);
+        node->_isolation->_queue.push(node);
+      }
+      else if(worker._wsq[0].try_push(node) == false) {
+        _spill(node);
+      }
+    }
+    _notifier.notify_n(num_nodes);
+    return;
+  }
+#endif
   if(auto n = worker._wsq[0].try_bulk_push(first, num_nodes); n != num_nodes) {
     _bulk_spill(first, num_nodes - n);
   }
@@ -2067,6 +2300,13 @@ void Executor::_bulk_schedule(Worker& worker, I first, size_t num_nodes) {
   for(size_t i=0; i<num_nodes; ++i) {
     Node* node = *first;
     ++first;
+#if TF_ISOLATION
+    if(node->_isolation) {
+      std::scoped_lock lock(node->_isolation->_mutex);
+      node->_isolation->_queue.push(node);
+      continue;
+    }
+#endif
     auto p = _pindex(node->_priority);
     hp += (p == 0);
     if((p > 0 && reserved) || worker._wsq[p].try_push(node) == false) {
@@ -2093,10 +2333,30 @@ inline void Executor::_bulk_schedule(I first, size_t num_nodes) {
   }
   
   // NOTE: We cannot use first/last in the for-loop (e.g., for(; first != last; ++first)).
-  // This is because when a node v is inserted into the queue, v can run and finish 
+  // This is because when a node v is inserted into the queue, v can run and finish
   // immediately. If v is the last node in the graph, it will tear down the parent task vector
   // which cause the last ++first to fail. This problem is specific to MSVC which has a stricter
   // iterator implementation in std::vector than GCC/Clang.
+#if TF_ISOLATION
+  // isolated nodes go to their scope queue, not the shared buffers
+  if(_num_scopes.load(std::memory_order_relaxed) > 0) {
+    size_t hp = 0;
+    for(size_t i=0; i<num_nodes; ++i) {
+      Node* node = *first;
+      ++first;
+      if(node->_isolation) {
+        std::scoped_lock lock(node->_isolation->_mutex);
+        node->_isolation->_queue.push(node);
+        continue;
+      }
+      hp += (_pindex(node->_priority) == 0);
+      _spill(node);
+    }
+    _notifier.notify_n(num_nodes);
+    _notify_hp(hp);
+    return;
+  }
+#endif
   auto hp = _bulk_spill(first, num_nodes);
   _notifier.notify_n(num_nodes);
   _notify_hp(hp);
@@ -2135,7 +2395,19 @@ inline void Executor::_invoke(Worker& worker, Node* node) {
     goto begin_invoke;              \
   }
 
+#if TF_ISOLATION
+  // adopt the node's isolation scope for the duration of this invocation —
+  // this is what confines the task's nested corun stealing to its scope and
+  // makes children it spawns inherit the scope. Continuation-cache hops
+  // re-adopt per iteration; the caller's scope is restored on every exit path.
+  ScopedIsolation _isolation_guard(pt::this_isolation);
+#endif
+
   begin_invoke:
+
+#if TF_ISOLATION
+  pt::this_isolation = node->_isolation;
+#endif
 
 #if TF_MAX_PRIORITY > 1
   // progress signal for the reserved-worker deadlock valve; only maintained
@@ -2657,6 +2929,13 @@ tf::Future<void> Executor::run_until(Taskflow& f, P&& p, C&& c) {
   auto t = std::make_shared<Topology>(f, std::forward<P>(p), std::forward<C>(c));
   //auto t = std::make_shared<DerivedTopology<P, C>>(f, std::forward<P>(p), std::forward<C>(c));
 
+#if TF_ISOLATION
+  // capture the submitting thread's isolation scope; applied to the
+  // topology's nodes at every set-up (including repeat runs set up later by
+  // unrelated workers)
+  t->_isolation = pt::this_isolation;
+#endif
+
   // need to create future before the topology got torn down quickly
   tf::Future<void> future(t->_promise.get_future(), t);
 
@@ -2739,13 +3018,24 @@ void Executor::_corun_until(Worker& w, P&& stop_predicate) {
 template <typename P>
 void Executor::_corun_until(Worker& w, P&& stop_predicate) {
 
+#if TF_ISOLATION
+  // corunning under an isolation scope: execute that scope's work only.
+  // Executing anything else here is the re-entrant self-steal deadlock — a
+  // stolen outer task may (transitively) wait on the very computation this
+  // corun belongs to, and it can never complete beneath it on this stack.
+  if(auto* scope = pt::this_isolation; scope) {
+    _corun_until_isolated(w, scope, std::forward<P>(stop_predicate));
+    return;
+  }
+#endif
+
   const size_t MAX_VICTIM = num_queues();
   const size_t MAX_STEALS = ((MAX_VICTIM + 1) << 1);
-    
+
   exploit:
 
   while(!stop_predicate()) {
-    
+
     // here we don't do while-loop to drain out the local queue as it can
     // potentially enter a very deep recursive corun, cuasing stack overflow
     if(auto t = _pop_priority(w._wsq); t) {
@@ -2758,6 +3048,15 @@ void Executor::_corun_until(Worker& w, P&& stop_predicate) {
       explore:
 
       t = _steal_task(w, vtm);
+
+#if TF_ISOLATION
+      // no regular work found: help any active isolation scope instead of
+      // spinning — a scope-0 corunner adopting an isolated task is always
+      // safe (isolated work never waits on outer work of this corun)
+      if(t == nullptr) {
+        t = _steal_isolated(w);
+      }
+#endif
 
       if(t) {
         _invoke(w, t);
@@ -2776,6 +3075,33 @@ void Executor::_corun_until(Worker& w, P&& stop_predicate) {
     }
   }
 }
+
+#if TF_ISOLATION
+// Function: _corun_until_isolated
+//
+// The corun loop of a thread running under an isolation scope: it drains the
+// scope's queue and nothing else. Scope work in flight on other workers is
+// awaited by polling the predicate (with yield backoff), exactly like the
+// regular corun when nothing is stealable.
+template <typename P>
+void Executor::_corun_until_isolated(Worker& w, IsolationScope* scope, P&& stop_predicate) {
+  size_t num_idles = 0;
+  while(!stop_predicate()) {
+    if(auto t = scope->_queue.steal(); t) {
+      _invoke(w, t);
+      num_idles = 0;
+    }
+    else if(!stop_predicate()) {
+      if(++num_idles > 2) {
+        std::this_thread::yield();
+      }
+    }
+    else {
+      break;
+    }
+  }
+}
+#endif
 
 // Function: corun
 template <typename T>
@@ -2853,12 +3179,25 @@ inline void Executor::_set_up_topology(Worker* w, Topology* tpg) {
 // Function: _set_up_graph
 inline size_t Executor::_set_up_graph(Graph& graph, Topology* tpg, NodeBase* parent) {
 
+#if TF_ISOLATION
+  // Topology-root setup (parent == tpg) may happen on an arbitrary worker
+  // (repeat runs, queued topologies), so it uses the scope captured at
+  // submission. Every other setup (corun graphs, subflows, modules) runs on
+  // the thread that spawns the graph and inherits that thread's live scope.
+  IsolationScope* scope =
+    (tpg != nullptr && parent == static_cast<NodeBase*>(tpg))
+      ? tpg->_isolation : pt::this_isolation;
+#endif
+
   auto first = graph.begin();
   auto last  = graph.end();
   auto send  = first;
   for(; first != last; ++first) {
 
     auto node = *first;
+#if TF_ISOLATION
+    node->_isolation = scope;
+#endif
     node->_topology = tpg;
     node->_parent = parent;
     node->_nstate = NSTATE::NONE;
