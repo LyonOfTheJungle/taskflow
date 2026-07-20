@@ -49,6 +49,8 @@
 #include <taskflow/taskflow.hpp>
 #include <taskflow/algorithm/for_each.hpp>
 
+#include <algorithm>
+
 // ============================================================================
 // 1. STL iterator parallelism
 // ============================================================================
@@ -470,6 +472,15 @@ int main(int argc, char* argv[]) {
     std::exit(EXIT_FAILURE);
   }
 
+  // The grid demos allocate O(N^2) and O(N^3) ints and compute flat indices in
+  // int; large N overflows both the index arithmetic (N*(N+1)*(N+2) exceeds
+  // INT_MAX near N=1290) and any sane memory budget. Cap the grid dimension so
+  // arbitrary N (useful for the print-heavy 1D demos) cannot crash the demo.
+  const int G = std::min(N, 128);
+  if (G != N) {
+    printf("(grid demos capped at %d to keep O(N^3) allocations and int index arithmetic valid)\n", G);
+  }
+
   printf("=== 1. STL iterator parallelism ===\n");
   demo_for_each(N);
 
@@ -480,19 +491,19 @@ int main(int argc, char* argv[]) {
   demo_for_each_by_index_1d(N);
 
   printf("\n=== 4a. 2D grid (unit steps) ===\n");
-  demo_2d(N, N + 3);          // deliberately non-square to stress partitioner
+  demo_2d(G, G + 3);          // deliberately non-square to stress partitioner
 
   printf("\n=== 4b. 3D volume (unit steps) ===\n");
-  demo_3d(N, N + 1, N + 2);   // three distinct dimensions
+  demo_3d(G, G + 1, G + 2);   // three distinct dimensions
 
   printf("\n=== 4c. 2D strided (step 2 x step 3) ===\n");
-  demo_2d_strided(N * 2, N * 3);
+  demo_2d_strided(G * 2, G * 3);
 
   printf("\n=== 4d. 2D negative steps (reverse traversal) ===\n");
-  demo_2d_negative_steps(N, N + 1);
+  demo_2d_negative_steps(G, G + 1);
 
   printf("\n=== 4e. 2D stateful range ===\n");
-  demo_2d_stateful(N, N + 2);
+  demo_2d_stateful(G, G + 2);
 
   return 0;
 }
